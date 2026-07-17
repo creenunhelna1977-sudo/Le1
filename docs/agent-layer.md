@@ -204,24 +204,108 @@ task.cancel()
 
 ---
 
+## v1 具体决策
+
+### continue() — 不做
+
+`continue()` 是从已有 context 恢复执行（不追加新 prompt）。PI 有它是因为 `Agent` 支持 session 恢复 + steering/followUp 注入。v1 没有 session，没有注入。想继续对话？再调 `agent.run("第二个问题")`。`self.messages` 在内存，自动累积。
+
+### Agent 类 — 保留（~80 行）
+
+不是因为它复杂，是因为它让调用方少管一个变量：
+
+```python
+# 纯函数方案：调用方追着 messages 跑
+messages = []
+async for e in run_agent(models, model, tools, messages, prompt): ...
+
+# Agent 类：messages 是内部状态，跑完自然完整
+agent = Agent(models, model, tools)
+async for e in agent.run(prompt): ...
+print(agent.messages)  # 完整 transcript
+```
+
+区别不是架构，是**谁持有 messages 引用**。Agent 类就是一个 namespace。
+
+### length 截断保护 — 做（5 行）
+
+场景：`max_tokens` 不够，输出砍在工具调用 JSON 参数中间：
+
+```
+模型产出: {"city": "北京", "date": "2026-07-
+流式修复: {"city": "北京", "date": "2026-07-"}  ← 合法 JSON，通过验证
+```
+
+**数据是错的，但 schema 验证放过去了。** 保护逻辑：`stopReason="length"` + 有工具调用 → 不执行，返回 error result，让模型重试完整参数。
+
+---
+
+## PI 功能对标
+
+| PI 功能 | PI 测试数 | 本质 | v1 |
+|---------|----------|------|-----|
+| 基础文本响应 | 1 | loop 转 AI 事件为 Agent 事件 | 做 |
+| 工具调用+执行 | 1 | toolUse → execute → result → 循环 | 做 |
+| length 截断保护 | 1 | 输出截断时不执行工具 | 做 |
+| 未知工具报错 | (loop 内置) | 工具名找不到 → error result | 做 |
+| 工具执行异常 | (loop 内置) | execute throw → error result | 做 |
+| 自定义消息转换 | 1 | `convertToLlm` 过滤/映射 | 不做 |
+| 上下文裁剪 | 1 | `transformContext` 删旧消息 | 不做 |
+| beforeToolCall | 1 | 权限拦截/改参 | 不做 |
+| prepareArguments | 1 | 模型输出格式修正 | 不做 |
+| 并行工具执行 | 4 | parallel/sequential/ordering | 不做 |
+| 工具流式进度 | 2 | `tool_execution_update` | 不做 |
+| steering 注入 | 1 | 运行中插入消息 | 不做 |
+| prepareNextTurn | 1 | 轮间换模型/prompt | 不做 |
+| shouldStopAfterTurn | 1 | 轮间条件停止 | 不做 |
+| terminate hint | 2 | 工具结果控制是否继续 | 不做 |
+| afterToolCall | 1 | 修改工具结果 | 不做 |
+| subscribe 观察者 | 4 | 多订阅者 | 不做 |
+| waitForIdle | 1 | 并发安全 | 不做 |
+| AbortController | 3 | 信号传递给订阅者 | 不做 |
+| continue() | 3 | 从已有状态恢复 | 不做 |
+
 ## v1 边界
 
-**做：**
+**做（6 项）：**
 
-- Agent 类 + `run()` async generator
-- AgentEvent 9 种事件类型
-- AgentTool + sequential 执行
-- 基础错误处理（工具未找到、执行异常）
+- Agent 类（~80 行）— 持有 messages、tools、model，提供 `run()` async generator
+- AgentEvent 9 种事件 — AgentStart/End, TurnStart/End, MessageStart/Update/End, ToolExecutionStart/End
+- AgentTool + sequential 执行 — find→execute→result→ToolResultMessage
+- length 截断保护 — `stopReason="length"` 时不执行工具，返回 error
+- 基础错误处理 — 工具未找到、执行异常 → error ToolResult
 - 单元测试 + 集成测试
 
-**不做：**
+**不做（17 项）：**
 
-- 并行工具执行 — v1 sequential，后续加 `asyncio.gather`
-- steering / followUp — v1 无中断注入需求
-- beforeToolCall / afterToolCall hooks — v1 工具直接执行
-- subscribe() 观察者 — `async for` 就是消费方式
-- asyncio.Task 生命周期管理 — 调用方的责任
+- 并行工具执行 — 后续 `asyncio.gather`
+- 工具流式进度 — 后续 `on_update` callback
+- steering / followUp — 有交互 UI 后加
+- continue() — 有 session 恢复后加
+- beforeToolCall / afterToolCall hooks — 有权限控制后加
+- prepareArguments — 工具接受标准 JSON，不需要
+- subscribe() / waitForIdle — `async for` 就是消费，`task.cancel()` 就是取消
+- AbortController — Python 不需要这个 Web API
+- convertToLlm / transformContext — 无自定义消息类型
+- shouldStopAfterTurn / prepareNextTurn — 无编排需求
 - AgentHarness / Session / Compaction — 后续层
+
+---
+
+## 拓展方向
+
+### 每个功能的触发条件
+
+| 功能 | 何时加 | 信号 |
+|------|--------|------|
+| 并行工具执行 | 有耗时>5s 的工具 | "怎么调两个 API 要等 10 秒" |
+| 工具流式进度 | 有需要 UI 进度条的工具 | "bash 跑了 30 秒没反应" |
+| steering | 有实时交互 UI | "能不能在跑的时候说一句话" |
+| followUp | 有自动编排需求 | "完成后自动做下一步" |
+| continue() | 有 session 恢复 | "从存档继续运行" |
+| hooks | 有权限控制 | "这个工具不能给用户自己调" |
+| subscribe() | 有多个消费者同时消费事件 | "日志、UI、存储都要看事件" |
+| AgentHarness | session + compaction 需求 | "对话太长，token 超了" |
 
 ---
 
