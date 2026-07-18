@@ -23,6 +23,7 @@ from rho.ai.types import (
     ImageContent,
     Message,
     Model,
+    SimpleStreamOptions,
     StartEvent,
     StopReason,
     StreamOptions,
@@ -164,7 +165,7 @@ def _convert_messages(
                     assistant_msg["reasoning_content"] = ""
 
             # Skip empty assistant messages
-            if not content and not tool_calls:
+            if not content and not tool_calls and not thinking_blocks:
                 continue
 
             params.append(assistant_msg)
@@ -253,6 +254,25 @@ def _parse_usage(raw: dict[str, Any]) -> dict[str, int]:
         "cache_write": raw.get("prompt_tokens_details", {}).get("cache_write_tokens", 0) or 0,
         "reasoning": raw.get("completion_tokens_details", {}).get("reasoning_tokens", 0) or 0,
     }
+
+
+def _update_cost(output: AssistantMessage, model: Model) -> None:
+    """Calculate response cost from the model's per-million-token rates."""
+    output.usage.cost.input = output.usage.input * model.cost.input / 1_000_000
+    output.usage.cost.output = output.usage.output * model.cost.output / 1_000_000
+    output.usage.cost.cache_read = output.usage.cache_read * model.cost.cache_read / 1_000_000
+    output.usage.cost.cache_write = output.usage.cache_write * model.cost.cache_write / 1_000_000
+    output.usage.cost.total = (
+        output.usage.cost.input
+        + output.usage.cost.output
+        + output.usage.cost.cache_read
+        + output.usage.cost.cache_write
+    )
+
+
+def _snapshot(output: AssistantMessage) -> AssistantMessage:
+    """Freeze the partial message state attached to a stream event."""
+    return output.model_copy(deep=True)
 
 
 def _map_stop_reason(finish_reason: str | None) -> tuple[StopReason, str | None]:
@@ -358,18 +378,18 @@ async def stream(
     headers: dict[str, str] = {}
     if opts.api_key:
         headers["Authorization"] = f"Bearer {opts.api_key}"
-    for key, value in opts.headers.items():
-        if value is not None and key.lower() != "authorization":
-            headers[key] = value
     # Model-level headers
     if model.headers:
         headers.update(model.headers)
+    for key, value in opts.headers.items():
+        if value is not None:
+            headers[key] = value
 
     client = HttpClient()
 
     try:
         # Emit start
-        yield StartEvent(partial=output)
+        yield StartEvent(partial=_snapshot(output))
 
         # Track streaming blocks
         blocks: list[dict[str, Any]] = []  # mutable content blocks
@@ -383,6 +403,9 @@ async def stream(
             url=f"{model.base_url}/chat/completions",
             json_data=body,
             headers=headers,
+            timeout_ms=opts.timeout_ms,
+            max_retries=opts.max_retries,
+            max_retry_delay_ms=opts.max_retry_delay_ms,
         ):
             if chunk.get("_done"):
                 continue
@@ -405,6 +428,7 @@ async def stream(
                     output.usage.input + output.usage.output
                     + output.usage.cache_read + output.usage.cache_write
                 )
+                _update_cost(output, model)
 
             choices = chunk.get("choices", [])
             if not choices:
@@ -418,6 +442,14 @@ async def stream(
                 u2 = _parse_usage(choice["usage"])
                 output.usage.input = max(output.usage.input, u2["input"])
                 output.usage.output = max(output.usage.output, u2["output"])
+                output.usage.cache_read = max(output.usage.cache_read, u2["cache_read"])
+                output.usage.cache_write = max(output.usage.cache_write, u2["cache_write"])
+                output.usage.reasoning = max(output.usage.reasoning or 0, u2["reasoning"])
+                output.usage.total_tokens = (
+                    output.usage.input + output.usage.output
+                    + output.usage.cache_read + output.usage.cache_write
+                )
+                _update_cost(output, model)
 
             # Finish reason
             finish = choice.get("finish_reason")
@@ -436,7 +468,7 @@ async def stream(
                     blocks.append(text_block)
                     ce_idx = blocks.index(text_block)
                     output.content.append(TextContent(text=""))
-                    yield TextStart(content_index=ce_idx, partial=output)
+                    yield TextStart(content_index=ce_idx, partial=_snapshot(output))
 
                 text_block["text"] += text
                 ce_idx = blocks.index(text_block)
@@ -445,15 +477,17 @@ async def stream(
                 yield TextDelta(
                     content_index=ce_idx,
                     delta=text,
-                    partial=output,
+                    partial=_snapshot(output),
                 )
 
             # Thinking/reasoning content
             reasoning = None
+            reasoning_signature: str | None = None
             for field in ["reasoning_content", "reasoning", "reasoning_text"]:
                 val = delta.get(field)
                 if isinstance(val, str) and val:
                     reasoning = val
+                    reasoning_signature = field
                     break
 
             if reasoning:
@@ -461,16 +495,23 @@ async def stream(
                     thinking_block = {"type": "thinking", "thinking": "", "signature": ""}
                     blocks.append(thinking_block)
                     ce_idx = blocks.index(thinking_block)
-                    output.content.append(ThinkingContent(thinking=""))
-                    yield ThinkingStart(content_index=ce_idx, partial=output)
+                    output.content.append(ThinkingContent(
+                        thinking="",
+                        thinking_signature=reasoning_signature,
+                    ))
+                    yield ThinkingStart(content_index=ce_idx, partial=_snapshot(output))
 
                 thinking_block["thinking"] += reasoning
+                thinking_block["signature"] = reasoning_signature or thinking_block.get("signature", "")
                 ce_idx = blocks.index(thinking_block)
-                output.content[ce_idx] = ThinkingContent(thinking=thinking_block["thinking"])
+                output.content[ce_idx] = ThinkingContent(
+                    thinking=thinking_block["thinking"],
+                    thinking_signature=thinking_block.get("signature") or None,
+                )
                 yield ThinkingDelta(
                     content_index=ce_idx,
                     delta=reasoning,
-                    partial=output,
+                    partial=_snapshot(output),
                 )
 
             # Tool calls
@@ -492,7 +533,7 @@ async def stream(
                         name=tool_blocks[idx]["name"],
                         arguments={},
                     ))
-                    yield ToolCallStart(content_index=ce_idx, partial=output)
+                    yield ToolCallStart(content_index=ce_idx, partial=_snapshot(output))
 
                 block = tool_blocks[idx]
                 if td.get("id") and not block["id"]:
@@ -513,7 +554,7 @@ async def stream(
                     yield ToolCallDelta(
                         content_index=ce_idx,
                         delta=args_delta,
-                        partial=output,
+                        partial=_snapshot(output),
                     )
 
         # Finish all open blocks
@@ -524,14 +565,17 @@ async def stream(
                 yield TextEnd(
                     content_index=ce_idx,
                     content=block["text"],
-                    partial=output,
+                    partial=_snapshot(output),
                 )
             elif block["type"] == "thinking":
-                output.content[ce_idx] = ThinkingContent(thinking=block["thinking"])
+                output.content[ce_idx] = ThinkingContent(
+                    thinking=block["thinking"],
+                    thinking_signature=block.get("signature") or None,
+                )
                 yield ThinkingEnd(
                     content_index=ce_idx,
                     content=block["thinking"],
-                    partial=output,
+                    partial=_snapshot(output),
                 )
             elif block["type"] == "toolCall":
                 # Strip partial_args before finalizing
@@ -544,7 +588,7 @@ async def stream(
                 yield ToolCallEnd(
                     content_index=ce_idx,
                     tool_call=tc,
-                    partial=output,
+                    partial=_snapshot(output),
                 )
 
         if not has_finish_reason:
@@ -590,9 +634,10 @@ def _build_request_body(
         body["store"] = False
 
     # Max tokens
-    if opts.max_tokens:
+    max_tokens = opts.max_tokens if opts.max_tokens is not None else model.max_tokens
+    if max_tokens is not None:
         field = compat.get("max_tokens_field", "max_completion_tokens")
-        body[field] = opts.max_tokens
+        body[field] = max_tokens
 
     # Temperature
     if opts.temperature is not None:
@@ -608,12 +653,13 @@ def _build_request_body(
 
     # Thinking / reasoning
     thinking_format = compat.get("thinking_format", "openai")
-    if thinking_format == "deepseek" and model.reasoning:
-        # DeepSeek uses `thinking: {type: "enabled"/"disabled"}`
-        # For now, default to not enabling thinking unless explicitly requested
-        pass  # thinking is model-specific, deferred to SimpleStreamOptions
-    elif thinking_format == "openai" and model.reasoning:
-        pass  # reasoning_effort set by stream_simple()
+    reasoning = getattr(opts, "reasoning", None)
+    if reasoning and model.reasoning:
+        mapped_reasoning = model.thinking_level_map.get(reasoning, reasoning)
+        if thinking_format == "deepseek":
+            body["thinking"] = {"type": "enabled"}
+        elif thinking_format == "openai" and compat.get("supports_reasoning_effort", True):
+            body["reasoning_effort"] = mapped_reasoning
 
     return body
 
@@ -625,12 +671,8 @@ def _build_request_body(
 async def stream_simple(
     model: Model,
     context: Context,
-    options: StreamOptions | None = None,
+    options: SimpleStreamOptions | None = None,
 ) -> AsyncGenerator[AssistantMessageEvent, None]:
-    """Simplified stream entry point — reasoning is handled by the caller.
-
-    For v1, this is a direct passthrough to stream(). Future versions
-    will map SimpleStreamOptions.reasoning to provider-specific thinking params.
-    """
+    """Map a simple reasoning level through the shared request builder."""
     async for event in stream(model, context, options):
         yield event

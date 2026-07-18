@@ -19,6 +19,7 @@ from rho.ai.types import (
     DoneEvent,
     ErrorEvent,
     Model,
+    SimpleStreamOptions,
     StreamOptions,
 )
 
@@ -93,43 +94,48 @@ class Models:
 
         Merges: provider auth → model headers → explicit options.
         """
+        _, resolved = await self._resolve_request(model, options)
+        return resolved
+
+    async def _resolve_request(
+        self,
+        model: Model,
+        options: StreamOptions | None,
+    ) -> tuple[Model, StreamOptions]:
+        """Resolve request auth, headers, environment, and endpoint overrides."""
         provider = self._providers.get(model.provider)
         if provider is None:
             raise ModelsError(f"Unknown provider: {model.provider}")
 
         opts = options or StreamOptions()
 
-        # If API key already provided explicitly, use it
-        if opts.api_key:
-            return opts
-
         # Resolve from provider auth
         result = await resolve_provider_auth(provider.auth, self._auth_ctx)
-        if result is None:
+        if result is None and not opts.api_key:
             raise ModelsError(f"Provider is not configured: {model.provider}")
 
         # Merge headers: provider → model → options (last wins)
         merged_headers: dict[str, str | None] = {}
-        if result.auth.headers:
+        if result and result.auth.headers:
             merged_headers.update(result.auth.headers)
+        if provider.headers:
+            merged_headers.update(provider.headers)
         if model.headers:
             merged_headers.update(model.headers)
         if opts.headers:
             merged_headers.update(opts.headers)
 
-        return StreamOptions(
-            api_key=result.auth.api_key,
-            headers=merged_headers,
-            temperature=opts.temperature,
-            max_tokens=opts.max_tokens,
-            timeout_ms=opts.timeout_ms,
-            max_retries=opts.max_retries,
-            max_retry_delay_ms=opts.max_retry_delay_ms,
-            cache_retention=opts.cache_retention,
-            session_id=opts.session_id,
-            metadata=opts.metadata,
-            env={**result.env, **opts.env},
+        resolved = opts.model_copy(update={
+            "api_key": opts.api_key or (result.auth.api_key if result else None),
+            "headers": merged_headers,
+            "env": {**(result.env if result else {}), **opts.env},
+        })
+        request_model = (
+            model.model_copy(update={"base_url": result.auth.base_url})
+            if result and result.auth.base_url
+            else model
         )
+        return request_model, resolved
 
     # ── Streaming ────────────────────────────────────────────────
 
@@ -144,9 +150,9 @@ class Models:
         Resolves auth, then delegates to the provider.
         """
         provider = self._get_provider_for(model)
-        resolved_opts = await self.resolve_auth(model, options)
+        request_model, resolved_opts = await self._resolve_request(model, options)
 
-        async for event in provider.stream(model, context, resolved_opts):
+        async for event in provider.stream(request_model, context, resolved_opts):
             yield event
 
     async def complete(
@@ -173,20 +179,20 @@ class Models:
         self,
         model: Model,
         context: Context,
-        options: StreamOptions | None = None,
+        options: SimpleStreamOptions | None = None,
     ) -> AsyncGenerator[AssistantMessageEvent, None]:
         """Stream with simplified options."""
         provider = self._get_provider_for(model)
-        resolved_opts = await self.resolve_auth(model, options)
+        request_model, resolved_opts = await self._resolve_request(model, options)
 
-        async for event in provider.stream_simple(model, context, resolved_opts):
+        async for event in provider.stream_simple(request_model, context, resolved_opts):
             yield event
 
     async def complete_simple(
         self,
         model: Model,
         context: Context,
-        options: StreamOptions | None = None,
+        options: SimpleStreamOptions | None = None,
     ) -> AssistantMessage:
         """Non-streaming with simplified options."""
         last_message: AssistantMessage | None = None

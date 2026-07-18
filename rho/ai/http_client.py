@@ -10,6 +10,7 @@ No provider SDKs — raw HTTP with full control.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, AsyncGenerator
 
@@ -44,7 +45,10 @@ def normalize_provider_error(error: Exception) -> ProviderError:
         try:
             body = response.json()
         except Exception:
-            body = response.text
+            try:
+                body = response.text
+            except Exception:
+                body = None
         return ProviderError(
             message=f"{status}: {_format_body(body)}",
             status=status,
@@ -138,6 +142,9 @@ class HttpClient:
         json_data: dict[str, Any],
         headers: dict[str, str] | None = None,
         method: str = "POST",
+        timeout_ms: int | None = None,
+        max_retries: int = 0,
+        max_retry_delay_ms: int = 60_000,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """Stream a Server-Sent Events response.
 
@@ -157,40 +164,62 @@ class HttpClient:
             **(headers or {}),
         }
 
-        try:
-            async with self._client.stream(
-                method=method,
-                url=url,
-                json=json_data,
-                headers=merged_headers,
-                timeout=httpx.Timeout(300.0, read=300.0),
-            ) as response:
-                response.raise_for_status()
+        attempts = 0
+        while True:
+            yielded = False
+            try:
+                request_timeout = (
+                    httpx.Timeout(timeout_ms / 1000, read=timeout_ms / 1000)
+                    if timeout_ms is not None
+                    else httpx.Timeout(300.0, read=300.0)
+                )
+                async with self._client.stream(
+                    method=method,
+                    url=url,
+                    json=json_data,
+                    headers=merged_headers,
+                    timeout=request_timeout,
+                ) as response:
+                    if response.is_error:
+                        # Streaming responses must be read before their body is inspected.
+                        await response.aread()
+                        response.raise_for_status()
 
-                event_type: str | None = None
-                data_lines: list[str] = []
+                    event_type: str | None = None
+                    data_lines: list[str] = []
 
-                async for line in response.aiter_lines():
-                    if line.startswith("event: "):
-                        event_type = line[7:].strip()
-                    elif line.startswith("data: "):
-                        data_lines.append(line[6:])
-                    elif line == "":
-                        # Empty line = event boundary
-                        if data_lines:
-                            yield self._parse_sse_event(
-                                "\n".join(data_lines), event_type
-                            )
-                            data_lines = []
-                            event_type = None
-                    # Lines starting with ":" are comments — ignore
+                    async for line in response.aiter_lines():
+                        if line.startswith("event:"):
+                            event_type = line[6:].lstrip()
+                        elif line.startswith("data:"):
+                            data_lines.append(line[5:].lstrip())
+                        elif line == "":
+                            if data_lines:
+                                yielded = True
+                                yield self._parse_sse_event(
+                                    "\n".join(data_lines), event_type
+                                )
+                                data_lines = []
+                                event_type = None
 
-                # Flush any remaining data at stream end
-                if data_lines:
-                    yield self._parse_sse_event("\n".join(data_lines), event_type)
+                    if data_lines:
+                        yielded = True
+                        yield self._parse_sse_event("\n".join(data_lines), event_type)
+                return
+            except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+                error = normalize_provider_error(exc)
+                retryable = (
+                    error.status in {408, 409, 429, 500, 502, 503, 504}
+                    or isinstance(exc, httpx.RequestError)
+                )
+                if not retryable or yielded or attempts >= max_retries:
+                    raise error from exc
 
-        except (httpx.HTTPStatusError, httpx.RequestError) as e:
-            raise normalize_provider_error(e) from e
+                delay_ms = 250 * (2 ** attempts)
+                if max_retry_delay_ms > 0:
+                    delay_ms = min(delay_ms, max_retry_delay_ms)
+                attempts += 1
+                await asyncio.sleep(delay_ms / 1000)
 
     @staticmethod
     def _parse_sse_event(data: str, event_type: str | None) -> dict[str, Any]:

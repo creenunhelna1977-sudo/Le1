@@ -23,6 +23,7 @@ from rho.ai.types import (
     ImageContent,
     Message,
     Model,
+    SimpleStreamOptions,
     StartEvent,
     StopReason,
     StreamOptions,
@@ -67,6 +68,25 @@ def _parse_streaming_json(text: str) -> dict[str, Any]:
             return json.loads(repaired)
         except json.JSONDecodeError:
             return {}
+
+
+def _update_cost(output: AssistantMessage, model: Model) -> None:
+    """Calculate response cost from the model's per-million-token rates."""
+    output.usage.cost.input = output.usage.input * model.cost.input / 1_000_000
+    output.usage.cost.output = output.usage.output * model.cost.output / 1_000_000
+    output.usage.cost.cache_read = output.usage.cache_read * model.cost.cache_read / 1_000_000
+    output.usage.cost.cache_write = output.usage.cache_write * model.cost.cache_write / 1_000_000
+    output.usage.cost.total = (
+        output.usage.cost.input
+        + output.usage.cost.output
+        + output.usage.cost.cache_read
+        + output.usage.cost.cache_write
+    )
+
+
+def _snapshot(output: AssistantMessage) -> AssistantMessage:
+    """Freeze the partial message state attached to a stream event."""
+    return output.model_copy(deep=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -282,16 +302,16 @@ async def stream(
             headers["x-api-key"] = opts.api_key
         else:
             headers["x-api-key"] = opts.api_key
-    for key, value in opts.headers.items():
-        if value is not None and key.lower() not in ("x-api-key", "anthropic-version"):
-            headers[key] = value
     if model.headers:
         headers.update(model.headers)
+    for key, value in opts.headers.items():
+        if value is not None:
+            headers[key] = value
 
     client = HttpClient()
 
     try:
-        yield StartEvent(partial=output)
+        yield StartEvent(partial=_snapshot(output))
 
         # Block tracking by Anthropic index
         content_index_by_an_index: dict[int, int] = {}
@@ -304,8 +324,17 @@ async def stream(
             url=f"{model.base_url}/v1/messages",
             json_data=body,
             headers=headers,
+            timeout_ms=opts.timeout_ms,
+            max_retries=opts.max_retries,
+            max_retry_delay_ms=opts.max_retry_delay_ms,
         ):
             event_type = event_data.pop("_sse_event", None)
+
+            if event_type == "error":
+                detail = event_data.get("error", event_data)
+                if isinstance(detail, dict) and detail.get("message"):
+                    raise RuntimeError(f"Anthropic stream error: {detail['message']}")
+                raise RuntimeError(f"Anthropic stream error: {json.dumps(detail)}")
 
             if event_type == "message_start":
                 saw_message_start = True
@@ -321,6 +350,7 @@ async def stream(
                         output.usage.input + output.usage.output
                         + output.usage.cache_read + output.usage.cache_write
                     )
+                    _update_cost(output, model)
 
             elif event_type == "content_block_start":
                 block = event_data.get("content_block", {})
@@ -333,7 +363,7 @@ async def stream(
                     ci = len(blocks) - 1
                     content_index_by_an_index[an_idx] = ci
                     output.content.append(TextContent(text=""))
-                    yield TextStart(content_index=ci, partial=output)
+                    yield TextStart(content_index=ci, partial=_snapshot(output))
 
                 elif btype == "thinking":
                     entry = {
@@ -346,7 +376,7 @@ async def stream(
                     ci = len(blocks) - 1
                     content_index_by_an_index[an_idx] = ci
                     output.content.append(ThinkingContent(thinking=""))
-                    yield ThinkingStart(content_index=ci, partial=output)
+                    yield ThinkingStart(content_index=ci, partial=_snapshot(output))
 
                 elif btype == "redacted_thinking":
                     entry = {
@@ -363,7 +393,7 @@ async def stream(
                         thinking="[Reasoning redacted]",
                         redacted=True,
                     ))
-                    yield ThinkingStart(content_index=ci, partial=output)
+                    yield ThinkingStart(content_index=ci, partial=_snapshot(output))
 
                 elif btype == "tool_use":
                     entry = {
@@ -382,7 +412,7 @@ async def stream(
                         name=entry["name"],
                         arguments=entry["arguments"],
                     ))
-                    yield ToolCallStart(content_index=ci, partial=output)
+                    yield ToolCallStart(content_index=ci, partial=_snapshot(output))
 
             elif event_type == "content_block_delta":
                 delta = event_data.get("delta", {})
@@ -397,13 +427,13 @@ async def stream(
                     text = delta.get("text", "")
                     block["text"] += text
                     output.content[ci] = TextContent(text=block["text"])
-                    yield TextDelta(content_index=ci, delta=text, partial=output)
+                    yield TextDelta(content_index=ci, delta=text, partial=_snapshot(output))
 
                 elif dtype == "thinking_delta":
                     thinking = delta.get("thinking", "")
                     block["thinking"] += thinking
                     output.content[ci] = ThinkingContent(thinking=block["thinking"])
-                    yield ThinkingDelta(content_index=ci, delta=thinking, partial=output)
+                    yield ThinkingDelta(content_index=ci, delta=thinking, partial=_snapshot(output))
 
                 elif dtype == "signature_delta":
                     sig = delta.get("signature", "")
@@ -418,7 +448,7 @@ async def stream(
                         name=block["name"],
                         arguments=block["arguments"],
                     )
-                    yield ToolCallDelta(content_index=ci, delta=partial, partial=output)
+                    yield ToolCallDelta(content_index=ci, delta=partial, partial=_snapshot(output))
 
             elif event_type == "content_block_stop":
                 an_idx = event_data.get("index", 0)
@@ -429,18 +459,18 @@ async def stream(
 
                 if block["type"] == "text":
                     output.content[ci] = TextContent(text=block["text"])
-                    yield TextEnd(content_index=ci, content=block["text"], partial=output)
+                    yield TextEnd(content_index=ci, content=block["text"], partial=_snapshot(output))
                 elif block["type"] == "thinking":
                     output.content[ci] = ThinkingContent(
                         thinking=block["thinking"],
                         thinking_signature=block.get("signature", ""),
                         redacted=block.get("redacted", False),
                     )
-                    yield ThinkingEnd(content_index=ci, content=block["thinking"], partial=output)
+                    yield ThinkingEnd(content_index=ci, content=block["thinking"], partial=_snapshot(output))
                 elif block["type"] == "toolCall":
                     tc = ToolCall(id=block["id"], name=block["name"], arguments=block["arguments"])
                     output.content[ci] = tc
-                    yield ToolCallEnd(content_index=ci, tool_call=tc, partial=output)
+                    yield ToolCallEnd(content_index=ci, tool_call=tc, partial=_snapshot(output))
 
             elif event_type == "message_delta":
                 delta = event_data.get("delta", {})
@@ -460,6 +490,7 @@ async def stream(
                         output.usage.input + output.usage.output
                         + output.usage.cache_read + output.usage.cache_write
                     )
+                    _update_cost(output, model)
 
             elif event_type == "message_stop":
                 saw_message_stop = True
@@ -527,7 +558,7 @@ def _build_request_body(
 async def stream_simple(
     model: Model,
     context: Context,
-    options: StreamOptions | None = None,
+    options: SimpleStreamOptions | None = None,
 ) -> AsyncGenerator[AssistantMessageEvent, None]:
     """Simplified stream entry point."""
     async for event in stream(model, context, options):

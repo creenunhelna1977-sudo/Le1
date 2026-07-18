@@ -15,6 +15,7 @@ from rho.ai.types import (
     AssistantMessageEvent,
     Context,
     Model,
+    SimpleStreamOptions,
     StreamOptions,
 )
 
@@ -22,6 +23,11 @@ from rho.ai.types import (
 # Type alias for a stream function
 StreamFunc = Callable[
     [Model, Context, StreamOptions | None],
+    AsyncGenerator[AssistantMessageEvent, None],
+]
+
+SimpleStreamFunc = Callable[
+    [Model, Context, SimpleStreamOptions | None],
     AsyncGenerator[AssistantMessageEvent, None],
 ]
 
@@ -44,7 +50,7 @@ class Provider:
         auth: ProviderAuth,
         models: list[Model],
         api: StreamFunc,
-        stream_simple_func: StreamFunc | None = None,
+        stream_simple_func: SimpleStreamFunc | None = None,
         headers: dict[str, str] | None = None,
     ):
         self.id = id
@@ -77,7 +83,7 @@ class Provider:
         self,
         model: Model,
         context: Context,
-        options: StreamOptions | None = None,
+        options: SimpleStreamOptions | None = None,
     ) -> AsyncGenerator[AssistantMessageEvent, None]:
         """Stream with simplified options (reasoning level)."""
         async for event in self._stream_simple_impl(model, context, options):
@@ -91,7 +97,7 @@ def create_provider(
     auth: ProviderAuth,
     models: list[Model],
     api: StreamFunc,
-    stream_simple: StreamFunc | None = None,
+    stream_simple: SimpleStreamFunc | None = None,
     headers: dict[str, str] | None = None,
 ) -> Provider:
     """Create a Provider from parts.
